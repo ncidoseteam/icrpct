@@ -295,26 +295,6 @@
       touch-action: none;
     }
 
-    .phantom-label {
-      position: absolute;
-      left: calc(100% + 8px);
-      min-width: 70px;
-      color: #000;
-      font-weight: 700;
-    }
-
-    .phantom-label.top {
-      top: -14px;
-    }
-
-    .phantom-label.middle {
-      top: calc(50% - 10px);
-    }
-
-    .phantom-label.bottom {
-      bottom: -8px;
-    }
-
     .dose-panel {
       overflow: hidden;
       border: 1px solid var(--line);
@@ -494,12 +474,6 @@
         grid-column: auto;
       }
 
-      .phantom-label {
-        left: auto;
-        right: 6px;
-        padding: 1px 4px;
-        background: rgba(255, 255, 255, 0.78);
-      }
     }
   </style>
 </head>
@@ -584,9 +558,6 @@
       <div class="middle-stack">
         <div class="phantom-wrap">
           <canvas id="phantomCanvas" width="500" height="500" aria-label="Phantom scan range canvas"></canvas>
-          <div id="phantomTop" class="phantom-label top">0 cm</div>
-          <div id="phantomMiddle" class="phantom-label middle"></div>
-          <div id="phantomBottom" class="phantom-label bottom"></div>
         </div>
 
         <fieldset class="scan-range-panel">
@@ -652,6 +623,7 @@
     const TCM_LINES = PHANTOMS * TCM_SPECTRA * TCM_COLUMNS;
     const DRAG_HANDLE_DISTANCE = 18;
     const KEYBOARD_STEP = 0.1;
+    const LITTLE_ENDIAN = new Uint8Array(new Uint16Array([1]).buffer)[0] === 1;
 
     const ctdiAirToW = [
       0.63714, 0.30933, 0.69260, 0.35215,
@@ -801,8 +773,6 @@
       state.sliceThickness = phantom.thickness;
 
       $("sliceThickness").textContent = phantom.label;
-      $("phantomMiddle").textContent = `${Math.round(phantom.height / 2)} cm`;
-      $("phantomBottom").textContent = `${Math.round(phantom.height)} cm`;
       $("effectiveLabel").textContent = genderIndex === 0 ? "E103F (mSv)" : "E103M (mSv)";
 
       if (resetScanRange) {
@@ -1097,8 +1067,103 @@
       await new Promise((resolve) => requestAnimationFrame(resolve));
     }
 
+    function parseCsvNumbers(text, expectedLines, filename) {
+      const expectedValues = expectedLines * SLICES;
+      const values = new Float64Array(expectedValues);
+      let offset = 0;
+      let lineCount = 0;
+      let lineValueCount = 0;
+      let tokenStart = 0;
+
+      for (let index = 0; index <= text.length; index += 1) {
+        const atEnd = index === text.length;
+        const char = atEnd ? 10 : text.charCodeAt(index);
+        if (!atEnd && char !== 44 && char !== 10 && char !== 13) continue;
+
+        if (index > tokenStart) {
+          if (lineValueCount < SLICES) {
+            if (offset >= expectedValues) {
+              throw new Error(`${filename} has more than ${expectedLines} lines.`);
+            }
+
+            const value = Number(text.slice(tokenStart, index));
+            if (!Number.isFinite(value)) {
+              throw new Error(`${filename} line ${lineCount + 1} contains an invalid value.`);
+            }
+
+            values[offset] = value;
+            offset += 1;
+          }
+          lineValueCount += 1;
+        } else if (char === 44) {
+          throw new Error(`${filename} line ${lineCount + 1} has an empty value.`);
+        }
+
+        if (char === 44) {
+          tokenStart = index + 1;
+          continue;
+        }
+
+        if (char === 13 && text.charCodeAt(index + 1) === 10) {
+          index += 1;
+        }
+
+        if (lineValueCount > 0) {
+          if (lineValueCount < SLICES) {
+            throw new Error(`${filename} line ${lineCount + 1} has ${lineValueCount} values; expected ${SLICES}.`);
+          }
+          lineCount += 1;
+          lineValueCount = 0;
+          if (lineCount > expectedLines) {
+            throw new Error(`${filename} has more than ${expectedLines} lines.`);
+          }
+        }
+
+        tokenStart = index + 1;
+      }
+
+      if (lineCount !== expectedLines) {
+        throw new Error(`${filename} has ${lineCount} lines; expected ${expectedLines}.`);
+      }
+      if (offset !== expectedValues) {
+        throw new Error(`${filename} has ${offset} values; expected ${expectedValues}.`);
+      }
+
+      return values;
+    }
+
+    function float64ArrayFromBuffer(buffer, expectedLines, filename) {
+      const expectedValues = expectedLines * SLICES;
+      const expectedBytes = expectedValues * Float64Array.BYTES_PER_ELEMENT;
+      if (buffer.byteLength !== expectedBytes) {
+        throw new Error(`${filename} has ${buffer.byteLength} bytes; expected ${expectedBytes}.`);
+      }
+
+      if (LITTLE_ENDIAN) {
+        return new Float64Array(buffer);
+      }
+
+      const view = new DataView(buffer);
+      const values = new Float64Array(expectedValues);
+      for (let index = 0; index < expectedValues; index += 1) {
+        values[index] = view.getFloat64(index * Float64Array.BYTES_PER_ELEMENT, true);
+      }
+      return values;
+    }
+
+    async function fetchBinaryTable(filename, expectedLines) {
+      const response = await fetch(filename);
+      if (!response.ok) {
+        const error = new Error(`Could not load ${filename}: HTTP ${response.status}`);
+        error.canFallbackToCsv = response.status === 404;
+        throw error;
+      }
+
+      const buffer = await response.arrayBuffer();
+      return float64ArrayFromBuffer(buffer, expectedLines, filename);
+    }
+
     async function fetchCsv(filename, expectedLines, label) {
-      setLoading(`Loading ${label}...`);
       const response = await fetch(filename);
       if (!response.ok) {
         throw new Error(`Could not load ${filename}: HTTP ${response.status}`);
@@ -1107,37 +1172,36 @@
       const text = await response.text();
       setLoading(`Parsing ${label}...`);
       await nextPaint();
+      return parseCsvNumbers(text, expectedLines, filename);
+    }
 
-      const lines = text.trim().split(/\r?\n/);
-      if (lines.length !== expectedLines) {
-        throw new Error(`${filename} has ${lines.length} lines; expected ${expectedLines}.`);
+    async function loadTable(binaryFilename, csvFilename, expectedLines) {
+      try {
+        return await fetchBinaryTable(binaryFilename, expectedLines);
+      } catch (error) {
+        if (!error.canFallbackToCsv) throw error;
       }
 
-      const values = new Float64Array(expectedLines * SLICES);
-      let offset = 0;
-      for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
-        const parts = lines[lineIndex].split(",");
-        if (parts.length < SLICES) {
-          throw new Error(`${filename} line ${lineIndex + 1} has ${parts.length} values; expected ${SLICES}.`);
-        }
-        for (let slice = 0; slice < SLICES; slice += 1) {
-          values[offset] = Number(parts[slice]);
-          offset += 1;
-        }
-      }
-      return values;
+      return fetchCsv(csvFilename, expectedLines, csvFilename);
     }
 
     async function loadData() {
       if (window.location.protocol === "file:") {
-        throw new Error("Open this calculator through a local web server so the CSV files can be loaded.");
+        throw new Error("Open this calculator through a local web server so the data files can be loaded.");
       }
 
-      state.dose = await fetchCsv("data_dcc_notcm.csv", DOSE_LINES, "data_dcc_notcm.csv");
+      setLoading("Loading calculation tables...");
       await nextPaint();
-      state.doseTcm = await fetchCsv("data_dcc_tcm.csv", DOSE_LINES, "data_dcc_tcm.csv");
-      await nextPaint();
-      state.tcm = await fetchCsv("data_tcm.csv", TCM_LINES, "data_tcm.csv");
+
+      [
+        state.dose,
+        state.doseTcm,
+        state.tcm
+      ] = await Promise.all([
+        loadTable("data_dcc_notcm.f64", "data_dcc_notcm.csv", DOSE_LINES),
+        loadTable("data_dcc_tcm.f64", "data_dcc_tcm.csv", DOSE_LINES),
+        loadTable("data_tcm.f64", "data_tcm.csv", TCM_LINES)
+      ]);
       state.dataReady = true;
     }
 
